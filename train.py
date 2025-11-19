@@ -1,123 +1,182 @@
 import torch
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn as nn
 import os
-import time
-from data import Wikitext103Loader
-from model import AlgebraicTransformerLM
-# --- Hyperparameters ---
-# Model Params (small, for an RTX 5090 this can be much larger)
-VOCAB_SIZE = -1 # Will be set by loader
-D_MODEL = 512
-N_HEAD = 8
-N_LAYERS = 6
-D_FFN = 4 * D_MODEL
-BLOCK_SIZE = 128     # Context window
-DROPOUT = 0.1
+import argparse
+import pandas as pd
+from tqdm import tqdm
+from wiktext_loader import WikitextLoader
 
-# Training Params
-N_EPOCHS = 10
-BATCH_SIZE = 32
-LR = 1e-4
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-DATA_DIR = "./data" # Directory to store Wikitext
-CHECKPOINT_DIR = "./checkpoints"
+# Import both architectures
+from algebraic_model import AlgebraicTransformerLM 
+from gpt_model import GPT, GPTConfig # Direct NanoGPT imports
 
-# --- Helper Functions ---
+# --- CONFIGURATIONS ---
+# 'power' is only used by the Algebraic model
+CONFIGS = {
+    'small': {
+        'd_model': 384, 'n_head': 6, 'n_layers': 6, 'batch_size': 64, 
+        'lr': 1e-3, 'dropout': 0.05, 'power': 32
+    },
+    'medium': {
+        'd_model': 768, 'n_head': 12, 'n_layers': 12, 'batch_size': 64, 
+        'lr': 6e-4, 'dropout': 0.1, 'power': 32
+    },
+    'large': {
+        'd_model': 1024, 'n_head': 16, 'n_layers': 24, 'batch_size': 64, 
+        'lr': 3e-4, 'dropout': 0.1, 'power': 32
+    }
+}
 
-def train(model, loader, optimizer, scaler, epoch):
-    model.train()
-    total_loss = 0
-    start_time = time.time()
-    
-    for i, (xb, yb) in enumerate(loader):
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        
-        # Forward pass with mixed precision
-        with autocast():
-            logits, loss = model(xb, yb)
-        
-        # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        
-        total_loss += loss.item()
-        
-        # Print progress
-        if i % 2000 == 0 and i > 0:
-            elapsed = time.time() - start_time
-            print(f"  Epoch {epoch+1} | Batch {i:5d}/{len(loader)} | Loss: {loss.item():.4f} | {elapsed:.2f}s")
-    
-    return total_loss / len(loader)
-
-def validate(model, loader):
+def evaluate(model, val_loader, device):
+    """
+    Runs validation on the FULL validation set.
+    Returns: Average Loss, Average Next-Token Accuracy
+    """
     model.eval()
     total_loss = 0
+    total_correct = 0
+    total_tokens = 0
+    count = 0
+    
+    val_x, val_y = val_loader[0], val_loader[1]
+    limit = len(val_x)
+    
     with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            with autocast():
-                logits, loss = model(xb, yb)
+        for i in range(limit):
+            xb = val_x[i].to(device)
+            yb = val_y[i].to(device)
+            
+            # NanoGPT and AlgebraicLM both support this signature
+            logits, loss = model(xb, yb)
             total_loss += loss.item()
-    return total_loss / len(loader)
+            
+            if hasattr(model, 'final_softmax'):
+                probs = model.final_softmax(logits)
+            else:
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                
+            preds = probs.argmax(dim=-1)
+            total_correct += (preds == yb).sum().item()
+            total_tokens += yb.numel()
+            count += 1
 
-# --- Main Execution ---
+    model.train()
+    return total_loss / count, total_correct / total_tokens
+
+def main():
+    parser = argparse.ArgumentParser()
+    # Renamed choice to 'nanogpt'
+    parser.add_argument('--model_type', type=str, required=True, choices=['nanogpt', 'algebraic'])
+    parser.add_argument('--size', type=str, default='small', choices=['small', 'medium', 'large'])
+    args = parser.parse_args()
+    
+    cfg = CONFIGS[args.size]
+    
+    D_MODEL = cfg['d_model']
+    N_HEAD = cfg['n_head']
+    N_LAYERS = cfg['n_layers']
+    BATCH_SIZE = cfg['batch_size']
+    DROPOUT = cfg['dropout']
+    POWER = cfg.get('power', 32)
+    
+    LR = cfg['lr'] 
+    
+    D_FFN = 4 * D_MODEL
+    BLOCK_SIZE = 128
+    WEIGHT_DECAY = 0.1
+    EPOCHS = 1
+    GRAD_CLIP = 1.0
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    RUN_NAME = f"{args.model_type}_{args.size}"
+    LOG_FILE = f"{RUN_NAME}.csv"
+    CHECKPOINT_DIR = f"checkpoints/{RUN_NAME}"
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    
+    print(f"--- Training {args.model_type.upper()} Transformer ({args.size}) ---")
+    print(f"Config: {D_MODEL}d / {N_LAYERS}L / {N_HEAD}h | LR: {LR}")
+    print(f"Training for exactly {EPOCHS} epoch.")
+    
+    print("Loading Data...")
+    loader = WikitextLoader(BLOCK_SIZE, BATCH_SIZE)
+    train_data = loader.get_loader('train')
+    val_data = loader.get_loader('validation')
+    
+    VOCAB_SIZE = train_data[2]
+    train_x, train_y = train_data[0], train_data[1]
+    
+    print(f"Vocab Size: {VOCAB_SIZE}")
+    print(f"Training Batches: {len(train_x)}")
+    
+    # 2. Initialize Model
+    if args.model_type == 'algebraic':
+        model = AlgebraicTransformerLM(
+            vocab_size=VOCAB_SIZE, d_model=D_MODEL, n_head=N_HEAD,
+            n_layers=N_LAYERS, d_ffn=D_FFN, block_size=BLOCK_SIZE, dropout=DROPOUT,
+            power=POWER
+        ).to(DEVICE)
+    else:
+        # Initialize NanoGPT via Config
+        # NanoGPT expects Bias=True by default for GPT2 reproduction
+        nanogpt_config = GPTConfig(
+            block_size=BLOCK_SIZE,
+            vocab_size=VOCAB_SIZE,
+            n_layer=N_LAYERS,
+            n_head=N_HEAD,
+            n_embd=D_MODEL,
+            dropout=DROPOUT,
+            bias=True 
+        )
+        model = GPT(nanogpt_config).to(DEVICE)
+    
+    print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    total_steps = len(train_x) * EPOCHS
+    
+    warmup_steps = int(0.1 * total_steps)
+    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    scheduler_decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_decay], milestones=[warmup_steps])
+    
+    if not os.path.exists(LOG_FILE):
+        pd.DataFrame(columns=['step', 'train_loss', 'val_loss', 'val_acc', 'lr']).to_csv(LOG_FILE, index=False)
+    
+    model.train()
+    step = 0
+    
+    for epoch in range(EPOCHS):
+        print(f"--- Epoch {epoch+1}/{EPOCHS} ---")
+        progress_bar = tqdm(range(len(train_x)))
+        
+        for i in progress_bar:
+            xb, yb = train_x[i].to(DEVICE), train_y[i].to(DEVICE)
+            
+            _, loss = model(xb, yb)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            scheduler.step()
+            
+            step += 1
+            progress_bar.set_description(f"Train Loss: {loss.item():.4f}")
+            
+            if step % 100 == 0:
+                val_loss, val_acc = evaluate(model, val_data, DEVICE)
+                current_lr = scheduler.get_last_lr()[0]
+                tqdm.write(f"Step {step} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
+                
+                log_entry = pd.DataFrame([[step, loss.item(), val_loss, val_acc, current_lr]], 
+                                       columns=['step', 'train_loss', 'val_loss', 'val_acc', 'lr'])
+                log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
+                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/latest_model.pt")
+            
+            if step % 1000 == 0:
+                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/step_{step}.pt")
+
+    print(f"Training Complete. Log saved to {LOG_FILE}")
 
 if __name__ == "__main__":
-    print(f"--- 1. Initializing Data Loader ---")
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    loader = Wikitext103Loader(
-        data_dir=DATA_DIR, 
-        block_size=BLOCK_SIZE, 
-        batch_size=BATCH_SIZE,
-        min_freq=100 
-    )
-    train_loader, val_loader, VOCAB_SIZE = loader.load()
-    
-    print(f"\n--- 2. Initializing Model ---")
-    model = AlgebraicTransformerLM(
-        vocab_size=VOCAB_SIZE,
-        d_model=D_MODEL,
-        n_head=N_HEAD,
-        n_layers=N_LAYERS,
-        d_ffn=D_FFN,
-        block_size=BLOCK_SIZE
-    )
-    model = model.to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    scaler = GradScaler()
-    
-    print(f"Model: {N_LAYERS} layers, {D_MODEL} d_model, {N_HEAD} heads, {BLOCK_SIZE} block_size")
-    print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    print(f"Device: {DEVICE}")
-
-    print("\n--- 3. Starting Training ---")
-    for epoch in range(N_EPOCHS):
-        epoch_start_time = time.time()
-        
-        # Train
-        train_loss = train(model, train_loader, optimizer, scaler, epoch)
-        
-        # Validate
-        val_loss = validate(model, val_loader)
-        
-        # Calculate Perplexity (PPL)
-        train_ppl = torch.exp(torch.tensor(train_loss))
-        val_ppl = torch.exp(torch.tensor(val_loss))
-        
-        # Log results
-        elapsed = time.time() - epoch_start_time
-        print("-" * 60)
-        print(f"Epoch {epoch+1:2d}/{N_EPOCHS} Summary:")
-        print(f"  Time: {elapsed:.2f}s")
-        print(f"  Train Loss: {train_loss:.4f} | Train PPL: {train_ppl:7.2f}")
-        print(f"  Val Loss:   {val_loss:.4f} | Val PPL:   {val_ppl:7.2f}")
-        
-        # Save model checkpoint
-        save_path = os.path.join(CHECKPOINT_DIR, f"algtr_epoch_{epoch+1}.pth")
-        torch.save(model.state_dict(), save_path)
-        print(f"  Checkpoint saved to {save_path}")
-        print("-" * 60)
-
-    print("--- 4. Training Complete ---")
+    main()
