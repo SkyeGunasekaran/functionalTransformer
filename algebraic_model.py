@@ -1,235 +1,279 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import os
+import argparse
+import csv
+import time
+import random
 import math
-# ----------------------------------------------------------------------
-# 1. Algebraic Norm (Rational L1 Projection)
-# ----------------------------------------------------------------------
-class AlgebraicNorm(nn.Module):
+import numpy as np
+from tqdm import tqdm
+from data.wikitext_loader import get_dataloaders
+from models.fast_algebraic import FastAlgebraicTransformerLM
+from models.nanogpt import GPT, GPTConfig 
+
+# -----------------------------------------------------------------------------
+# 1. Scientific Configuration
+# -----------------------------------------------------------------------------
+CONFIGS = {
+    # Target: ~50M Params
+    # Breakdown: 26M (Embeddings) + 25M (Layers) = ~51M Total
+    'small':  {
+        'd_model': 512, 
+        'n_head': 8,  
+        'n_layers': 8,   
+        'batch_size': 8, 
+        'accum_steps': 8, 
+        'lr': 8e-4,      
+        'dropout': 0.1
+    },
+
+    # Target: ~85M Params
+    # Breakdown: 39M (Embeddings) + 42M (Layers) = ~81M Total
+    'medium': {
+        'd_model': 768, 
+        'n_head': 12, 
+        'n_layers': 6,   
+        'batch_size': 8,  
+        'accum_steps': 8, 
+        'lr': 7e-4,    
+        'dropout': 0.1
+    },
+
+    # Target: ~120M Params (Standard GPT-2 Small)
+    # Breakdown: 39M (Embeddings) + 85M (Layers) = ~124M Total
+    'large':  {
+        'd_model': 768, 
+        'n_head': 12, 
+        'n_layers': 12, 
+        'batch_size': 8,  
+        'accum_steps': 8, 
+        'lr': 6e-4,   
+        'dropout': 0.1
+    }
+}
+
+# -----------------------------------------------------------------------------
+# 2. Power Scheduler (Curriculum Learning)
+# -----------------------------------------------------------------------------
+def update_model_power(model, progress, start_power=2.0, max_power=8.0):
     """
-    Projects data onto the L1 'Diamond'.
-    Formula: y = g * (x / (mean(|x|) + eps))
-    Properties: Purely rational, sparsity-inducing, no square roots.
+    Applies the annealing schedule to the Algebraic Attention.
+    Schedule: Linear Ramp (0% -> 60%) -> Constant Max (60% -> 100%)
     """
-    def __init__(self, d_model, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.gain = nn.Parameter(torch.ones(d_model))
+    anneal_cutoff = 0.60 # Anneal over the first 60% of training
+    
+    if progress < anneal_cutoff:
+        # Linear Ramp: Start -> Target
+        pct = progress / anneal_cutoff
+        new_power = start_power + (max_power - start_power) * pct
+    else:
+        # Constant Max Phase (The "Sharp" Phase)
+        new_power = max_power
+    
+    # In-place update of registered buffers
+    if hasattr(model, 'update_power'):
+        model.update_power(new_power)
+    
+    return new_power
 
-    def forward(self, x):
-        # Mean Absolute Deviation (L1 proxy)
-        l1_norm = x.abs().mean(dim=-1, keepdim=True)
-        return self.gain * (x / (l1_norm + self.eps))
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.manual_seed_all(seed)
+        # For strict scientific reproducibility (might slow down slightly)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-# ----------------------------------------------------------------------
-# 2. Activations & Rational Softmax
-# ----------------------------------------------------------------------
-class AlgebraicReLU(nn.Module):
-    def forward(self, x):
-        # Piecewise linear (Identity for x>0, Zero constant for x<=0)
-        # This is fundamentally algebraic (Order 1 Spline).
-        return torch.where(x > 0, x, torch.tensor(0.0, device=x.device, dtype=x.dtype))
+def get_device():
+    if torch.cuda.is_available(): return 'cuda'
+    if torch.backends.mps.is_available(): return 'mps'
+    return 'cpu'
 
-class RationalSoftmax(nn.Module):
-    """
-    Uses Domain Compression & Polynomial Sharpening.
-    1. Squash (-inf, inf) -> (-1, 1) via x / (1+|x|)
-    2. Shift to (0, 1)
-    3. Sharpen via power k to mimic 'winner-takes-all'
-    """
-    def __init__(self, power=4, eps=1e-6):
-        super().__init__()
-        self.power = power
-        self.eps = eps
+@torch.no_grad()
+def evaluate(model, val_loader, device, ctx):
+    model.eval()
+    total_loss = 0
+    count = 0
+    
+    for xb, yb in val_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        with ctx:
+            _, loss = model(xb, yb)
+        total_loss += loss.item()
+        count += 1
+        
+    avg_loss = total_loss / count if count > 0 else 0
+    model.train()
+    return avg_loss
 
-    def forward(self, x):
-        # 1. Domain Compression (Algebraic Sigmoid)
-        # No hard clamping needed; asymptotes handle infinity.
-        # s in (-1, 1)
-        s = x / (x.abs() + 1.0)
+# -----------------------------------------------------------------------------
+# 3. Main Loop
+# -----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_type', type=str, required=True, choices=['nanogpt', 'algebraic'])
+    parser.add_argument('--size', type=str, default='small', choices=['small', 'medium', 'large'])
+    parser.add_argument('--seed', type=int, default=1337)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=1) 
+    parser.add_argument('--block_size', type=int, default=1024)
+    args = parser.parse_args()
 
-        # 2. Shift to Probability Base (0, 1)
-        p_base = (s + 1.0) / 2.0
+    set_seed(args.seed)
+    DEVICE = get_device()
+    # High precision for accumulation stability
+    torch.set_float32_matmul_precision('high') 
+    
+    cfg = CONFIGS[args.size]
+    
+    # Run Config
+    RUN_NAME = f"{args.model_type}_{args.size}_s{args.seed}"
+    OUT_DIR = f"results/{RUN_NAME}"
+    os.makedirs(OUT_DIR, exist_ok=True)
+    
+    # CSV Logger Setup
+    csv_path = os.path.join(OUT_DIR, 'metrics.csv')
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    # Header
+    csv_writer.writerow(['step', 'epoch', 'train_loss', 'val_loss', 'val_ppl', 'power', 'lr'])
+    
+    print(f"\n=== STARTING EXPERIMENT: {RUN_NAME} ===")
+    print(f"Config: {cfg}")
+    
+    # Data
+    print("Loading WikiText-103...")
+    train_loader, val_loader, VOCAB_SIZE = get_dataloaders(
+        cfg['batch_size'], args.block_size, num_workers=args.workers
+    )
+    
+    # Calculation of steps
+    steps_per_epoch = len(train_loader) // cfg['accum_steps']
+    total_steps = steps_per_epoch * args.epochs
+    print(f"Vocab: {VOCAB_SIZE} | Total Optimization Steps: {total_steps}")
 
-        # 3. Polynomial Sharpening (Degree Elevation)
-        unnorm_probs = p_base.pow(self.power)
-
-        # 4. Normalization
-        return unnorm_probs / (unnorm_probs.sum(dim=-1, keepdim=True) + self.eps)
-
-# ----------------------------------------------------------------------
-# 3. Algebraic Loss (Geometric Distance)
-# ----------------------------------------------------------------------
-class AlgebraicMSELoss(nn.Module):
-    """
-    Measures Euclidean distance on the probability simplex.
-    Optimized to avoid creating dense One-Hot tensors for large vocabularies.
-    L = sum((p - y)^2) = sum(p^2) - 2*p_target + 1
-    """
-    def __init__(self, num_classes):
-        super().__init__()
-        self.num_classes = num_classes
-
-    def forward(self, probs, targets):
-        # probs: [Batch*Seq, Vocab]
-        # targets: [Batch*Seq]
-
-        # 1. Sum of squared probabilities (The "Energy" of the prediction)
-        sum_sq_probs = probs.pow(2).sum(dim=-1)
-
-        # 2. Probability assigned to the correct target
-        # We use gather to avoid creating a massive One-Hot tensor
-        p_target = probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
-
-        # 3. Algebraic Expansion of (p - one_hot)^2
-        loss = sum_sq_probs - 2*p_target + 1.0
-
-        return loss.mean()
-
-# ----------------------------------------------------------------------
-# 4. Algebraic Attention
-# ----------------------------------------------------------------------
-class AlgebraicAttention(nn.Module):
-    def __init__(self, d_model, n_head, dropout=0.1, power=4):
-        super().__init__()
-        assert d_model % n_head == 0
-        self.n_head = n_head
-        self.d_head = d_model // n_head
-
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        # We remove head_scale logic in favor of strict Score Normalization
-        # This learnable gain controls exactly how "sharp" the attention is.
-        # We init at 4.0 because x=4.0 is where Rational Sigmoid hits ~0.8 (strong signal)
-        self.score_gain = nn.Parameter(torch.tensor(4.0))
-
-        self.rational_softmax = RationalSoftmax(power)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, causal_mask=None):
-        B, T, C = x.shape
-        Q = self.q_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
-        K = self.k_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
-        V = self.v_proj(x).view(B, T, self.n_head, self.d_head).transpose(1, 2)
-
-        # 1. Raw Expansion
-        scores = torch.matmul(Q, K.transpose(-2, -1))
-
-        # 2. ALGEBRAIC SCORE NORMALIZATION (The Fix)
-        # We force the scores to fit into the rational curve's sensitive region.
-
-        # A. Zero Centering (Remove shift)
-        scores_mean = scores.mean(dim=-1, keepdim=True)
-        scores = scores - scores_mean
-
-        # B. L1 Variance Normalization (Rational "Standard Deviation")
-        # mad = Mean Absolute Deviation
-        scores_mad = scores.abs().mean(dim=-1, keepdim=True) + 1e-6
-        scores = scores / scores_mad
-
-        # C. Controlled Scaling
-        # Now scores are effectively [-1, 1] (on average).
-        # We multiply by score_gain to stretch them to [-4, 4] or whatever the model needs.
-        scores = scores * self.score_gain
-
-        if causal_mask is not None:
-            scores = scores.masked_fill(causal_mask, -1000.0)
-
-        # Contraction
-        attn_weights = self.rational_softmax(scores)
-        attn_weights = self.dropout(attn_weights)
-        out = torch.matmul(attn_weights, V)
-        return self.out_proj(out.transpose(1, 2).reshape(B, T, C))
-# 5. Transformer Block (Pre-Norm)
-# ----------------------------------------------------------------------
-class AlgebraicTransformerBlock(nn.Module):
-    def __init__(self, d_model, n_head, d_ffn, dropout=0.1, power=4):
-        super().__init__()
-        self.attn = AlgebraicAttention(d_model, n_head, dropout, power)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ffn),
-            AlgebraicReLU(),
-            nn.Linear(d_ffn, d_model),
-            nn.Dropout(dropout)
+    # Model
+    if args.model_type == 'algebraic':
+        model = FastAlgebraicTransformerLM(
+            vocab_size=VOCAB_SIZE, 
+            d_model=cfg['d_model'], 
+            n_head=cfg['n_head'],
+            n_layers=cfg['n_layers'], 
+            d_ffn=4*cfg['d_model'], 
+            block_size=args.block_size, 
+            dropout=cfg['dropout'],
+            power=2.0, # Initial Power
         )
-        self.norm1 = AlgebraicNorm(d_model)
-        self.norm2 = AlgebraicNorm(d_model)
+    else:
+        nanogpt_config = GPTConfig(
+            block_size=args.block_size, vocab_size=VOCAB_SIZE, n_layer=cfg['n_layers'],
+            n_head=cfg['n_head'], n_embd=cfg['d_model'], dropout=cfg['dropout'], bias=True
+        )
+        model = GPT(nanogpt_config)
 
-    def forward(self, x, causal_mask=None):
-        x = x + self.attn(self.norm1(x), causal_mask=causal_mask)
-        x = x + self.ffn(self.norm2(x))
-        return x
+    model.to(DEVICE)
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-# ----------------------------------------------------------------------
-# 6. The Model
-# ----------------------------------------------------------------------
-class AlgebraicTransformerLM(nn.Module):
-    def __init__(self, vocab_size, d_model, n_head, n_layers, d_ffn, block_size, dropout=0.1, power=4):
-        super().__init__()
-        self.block_size = block_size
-        self.vocab_size = vocab_size
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=0.1)
+    
+    # Scheduler (Warmup + Cosine Decay)
+    warmup_steps = int(total_steps * 0.10) # 10% LR warmup
+    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
-        self.token_embedding_table = nn.Embedding(vocab_size, d_model)
-        self.position_embedding_table = nn.Embedding(block_size, d_model)
-        self.blocks = nn.ModuleList([
-            AlgebraicTransformerBlock(d_model, n_head, d_ffn, dropout, power)
-            for _ in range(n_layers)
-        ])
+    # Mixed Precision
+    pt_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    ctx = torch.amp.autocast(device_type=DEVICE, dtype=pt_dtype)
+    scaler = torch.amp.GradScaler('cuda', enabled=(pt_dtype == torch.float16))
 
-        self.final_norm = AlgebraicNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size)
+    # State Tracking
+    model.train()
+    train_loss_accum = 0.0
+    log_step_accum = 0 
+    global_step = 0
+    current_power = 2.0
+    start_time = time.time()
 
-        # Causal Mask
-        causal_mask = torch.triu(torch.ones(block_size, block_size), diagonal=1).bool()
-        self.register_buffer('causal_mask', causal_mask.view(1, 1, block_size, block_size))
+    # --- TRAINING LOOP ---
+    optimizer.zero_grad(set_to_none=True)
+    
+    # Flatten loader for easier step tracking
+    train_iter = iter(train_loader)
+    
+    # Progress bar based on optimization steps (not batches)
+    pbar = tqdm(range(total_steps), desc="Training")
+    
+    for step in pbar:
 
-        # Purely Algebraic Loss
-        self.criterion = AlgebraicMSELoss(num_classes=vocab_size)
+        if args.model_type == 'algebraic':
+            progress = step / total_steps
+            current_power = update_model_power(model, progress)
+        # Gradient Accumulation Loop
+        for micro_step in range(cfg['accum_steps']):
+            try:
+                xb, yb = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader) # Restart epoch if needed
+                xb, yb = next(train_iter)
+            
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            
+            with ctx:
+                _, loss = model(xb, yb)
+                # Scale loss for accumulation
+                loss = loss / cfg['accum_steps']
+            
+            train_loss_accum += loss.item()
+            scaler.scale(loss).backward()
 
-        # final softmax for inference/loss
-        self.final_softmax = RationalSoftmax(power=4)
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
+        # Optimizer Step
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        
+        global_step += 1
+        log_step_accum += 1
+        
+        # --- PERIODIC EVALUATION (Every 100 steps) ---
+        if global_step % 100 == 0 or global_step == total_steps:
+            # Calculate metrics - FIX: Average over the steps since last log
+            avg_train_loss = train_loss_accum / log_step_accum
+            train_loss_accum = 0.0 # Reset accumulator
+            log_step_accum = 0     # Reset step count
+            
+            val_loss = evaluate(model, val_loader, DEVICE, ctx)
+            val_ppl = math.exp(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Log to CSV
+            csv_writer.writerow([global_step, 1, avg_train_loss, val_loss, val_ppl, current_power, current_lr])
+            csv_file.flush() # Ensure data is written in case of crash
+            
+            # Update TQDM
+            pbar.set_postfix({
+                'Val Loss': f"{val_loss:.3f}",
+                'PPL': f"{val_ppl:.1f}",
+                'Power': f"{current_power:.1f}" if args.model_type == 'algebraic' else "N/A"
+            })
+            
+            # Save intermediate checkpoint
+            torch.save(model.state_dict(), os.path.join(OUT_DIR, 'latest_ckpt.pt'))
 
-        # 1. Embedding (Lookup is technically algebraic selection)
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
-        x = tok_emb + pos_emb
-        mask = self.causal_mask[:, :, :T, :T]
+    # --- FINISH ---
+    print("\nTraining Complete.")
+    csv_file.close()
+    
+    # Save Final Model
+    torch.save(model.state_dict(), os.path.join(OUT_DIR, 'final_model.pt'))
+    print(f"Saved final model to {os.path.join(OUT_DIR, 'final_model.pt')}")
 
-        # 2. Process Blocks
-        for block in self.blocks:
-            x = block(x, causal_mask=mask)
-
-        # 3. Final Projection
-        x = self.final_norm(x)
-        logits = self.lm_head(x) # [B, T, Vocab]
-
-        loss = None
-        if targets is not None:
-            # Important: The output of lm_head is unbounded "Energy".
-            # We must project it to Probability Space before calculating
-            # Geometric distance, otherwise MSE is meaningless.
-
-            # We use the same Rational Softmax logic here:
-            probs = self.final_softmax(logits)
-
-            flat_probs = probs.reshape(-1, self.vocab_size)
-            flat_targets = targets.reshape(-1)
-
-            loss = self.criterion(flat_probs, flat_targets)
-
-        return logits, loss
-    def generate(self, idx, max_new_tokens):
-        # Simple generation loop
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = self.final_softmax(logits)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
+if __name__ == "__main__":
+    main()
