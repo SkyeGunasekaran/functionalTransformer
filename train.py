@@ -1,182 +1,279 @@
 import torch
-import torch.nn as nn
 import os
 import argparse
-import pandas as pd
+import csv
+import time
+import random
+import math
+import numpy as np
 from tqdm import tqdm
-from wikitext_loader import WikitextLoader
+from data.wikitext_loader import get_dataloaders
+from models.fast_algebraic import FastAlgebraicTransformerLM
+from models.nanogpt import GPT, GPTConfig 
 
-# Import both architectures
-from algebraic_model import AlgebraicTransformerLM
-from gpt_model import GPT, GPTConfig # Direct NanoGPT imports
-
-# --- CONFIGURATIONS ---
-# 'power' is only used by the Algebraic model
+# -----------------------------------------------------------------------------
+# 1. Scientific Configuration
+# -----------------------------------------------------------------------------
 CONFIGS = {
-    'small': {
-        'd_model': 384, 'n_head': 6, 'n_layers': 6, 'batch_size': 256,
-        'lr': 1e-3, 'dropout': 0.05, 'power': 32
+    # Target: ~50M Params
+    # Breakdown: 26M (Embeddings) + 25M (Layers) = ~51M Total
+    'small':  {
+        'd_model': 512, 
+        'n_head': 8,  
+        'n_layers': 8,   
+        'batch_size': 8, 
+        'accum_steps': 8, 
+        'lr': 8e-4,      
+        'dropout': 0.1
     },
+
+    # Target: ~85M Params
+    # Breakdown: 39M (Embeddings) + 42M (Layers) = ~81M Total
     'medium': {
-        'd_model': 768, 'n_head': 12, 'n_layers': 12, 'batch_size': 128,
-        'lr': 6e-4, 'dropout': 0.1, 'power': 32
+        'd_model': 768, 
+        'n_head': 12, 
+        'n_layers': 6,   
+        'batch_size': 8,  
+        'accum_steps': 8, 
+        'lr': 7e-4,    
+        'dropout': 0.1
     },
-    'large': {
-        'd_model': 1024, 'n_head': 16, 'n_layers': 24, 'batch_size': 64,
-        'lr': 3e-4, 'dropout': 0.1, 'power': 32
+
+    # Target: ~120M Params (Standard GPT-2 Small)
+    # Breakdown: 39M (Embeddings) + 85M (Layers) = ~124M Total
+    'large':  {
+        'd_model': 768, 
+        'n_head': 12, 
+        'n_layers': 12, 
+        'batch_size': 8,  
+        'accum_steps': 8, 
+        'lr': 6e-4,   
+        'dropout': 0.1
     }
 }
 
-def evaluate(model, val_loader, device):
+# -----------------------------------------------------------------------------
+# 2. Power Scheduler (Curriculum Learning)
+# -----------------------------------------------------------------------------
+def update_model_power(model, progress, start_power=2.0, max_power=8.0):
     """
-    Runs validation on the FULL validation set.
-    Returns: Average Loss, Average Next-Token Accuracy
+    Applies the annealing schedule to the Algebraic Attention.
+    Schedule: Linear Ramp (0% -> 60%) -> Constant Max (60% -> 100%)
     """
+    anneal_cutoff = 0.60 # Anneal over the first 60% of training
+    
+    if progress < anneal_cutoff:
+        # Linear Ramp: Start -> Target
+        pct = progress / anneal_cutoff
+        new_power = start_power + (max_power - start_power) * pct
+    else:
+        # Constant Max Phase (The "Sharp" Phase)
+        new_power = max_power
+    
+    # In-place update of registered buffers
+    if hasattr(model, 'update_power'):
+        model.update_power(new_power)
+    
+    return new_power
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.manual_seed_all(seed)
+        # For strict scientific reproducibility (might slow down slightly)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def get_device():
+    if torch.cuda.is_available(): return 'cuda'
+    if torch.backends.mps.is_available(): return 'mps'
+    return 'cpu'
+
+@torch.no_grad()
+def evaluate(model, val_loader, device, ctx):
     model.eval()
     total_loss = 0
-    total_correct = 0
-    total_tokens = 0
     count = 0
-
-    val_x, val_y = val_loader[0], val_loader[1]
-    limit = len(val_x)
-
-    with torch.no_grad():
-        for i in range(limit):
-            xb = val_x[i].to(device)
-            yb = val_y[i].to(device)
-
-            # NanoGPT and AlgebraicLM both support this signature
-            logits, loss = model(xb, yb)
-            total_loss += loss.item()
-
-            if hasattr(model, 'final_softmax'):
-                probs = model.final_softmax(logits)
-            else:
-                probs = torch.nn.functional.softmax(logits, dim=-1)
-
-            preds = probs.argmax(dim=-1)
-            total_correct += (preds == yb).sum().item()
-            total_tokens += yb.numel()
-            count += 1
-
+    
+    for xb, yb in val_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        with ctx:
+            _, loss = model(xb, yb)
+        total_loss += loss.item()
+        count += 1
+        
+    avg_loss = total_loss / count if count > 0 else 0
     model.train()
-    return total_loss / count, total_correct / total_tokens
+    return avg_loss
 
+# -----------------------------------------------------------------------------
+# 3. Main Loop
+# -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    # Renamed choice to 'nanogpt'
     parser.add_argument('--model_type', type=str, required=True, choices=['nanogpt', 'algebraic'])
     parser.add_argument('--size', type=str, default='small', choices=['small', 'medium', 'large'])
+    parser.add_argument('--seed', type=int, default=1337)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=1) 
+    parser.add_argument('--block_size', type=int, default=1024)
     args = parser.parse_args()
 
+    set_seed(args.seed)
+    DEVICE = get_device()
+    # High precision for accumulation stability
+    torch.set_float32_matmul_precision('high') 
+    
     cfg = CONFIGS[args.size]
+    
+    # Run Config
+    RUN_NAME = f"{args.model_type}_{args.size}_s{args.seed}"
+    OUT_DIR = f"results/{RUN_NAME}"
+    os.makedirs(OUT_DIR, exist_ok=True)
+    
+    # CSV Logger Setup
+    csv_path = os.path.join(OUT_DIR, 'metrics.csv')
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    # Header
+    csv_writer.writerow(['step', 'epoch', 'train_loss', 'val_loss', 'val_ppl', 'power', 'lr'])
+    
+    print(f"\n=== STARTING EXPERIMENT: {RUN_NAME} ===")
+    print(f"Config: {cfg}")
+    
+    # Data
+    print("Loading WikiText-103...")
+    train_loader, val_loader, VOCAB_SIZE = get_dataloaders(
+        cfg['batch_size'], args.block_size, num_workers=args.workers
+    )
+    
+    # Calculation of steps
+    steps_per_epoch = len(train_loader) // cfg['accum_steps']
+    total_steps = steps_per_epoch * args.epochs
+    print(f"Vocab: {VOCAB_SIZE} | Total Optimization Steps: {total_steps}")
 
-    D_MODEL = cfg['d_model']
-    N_HEAD = cfg['n_head']
-    N_LAYERS = cfg['n_layers']
-    BATCH_SIZE = cfg['batch_size']
-    DROPOUT = cfg['dropout']
-    POWER = cfg.get('power', 32)
-
-    LR = cfg['lr']
-
-    D_FFN = 4 * D_MODEL
-    BLOCK_SIZE = 128
-    WEIGHT_DECAY = 0.1
-    EPOCHS = 1
-    GRAD_CLIP = 1.0
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    RUN_NAME = f"{args.model_type}_{args.size}"
-    LOG_FILE = f"{RUN_NAME}.csv"
-    CHECKPOINT_DIR = f"checkpoints/{RUN_NAME}"
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-    print(f"--- Training {args.model_type.upper()} Transformer ({args.size}) ---")
-    print(f"Config: {D_MODEL}d / {N_LAYERS}L / {N_HEAD}h | LR: {LR}")
-    print(f"Training for exactly {EPOCHS} epoch.")
-
-    print("Loading Data...")
-    loader = WikitextLoader(BLOCK_SIZE, BATCH_SIZE)
-    train_data = loader.get_loader('train')
-    val_data = loader.get_loader('validation')
-
-    VOCAB_SIZE = train_data[2]
-    train_x, train_y = train_data[0], train_data[1]
-
-    print(f"Vocab Size: {VOCAB_SIZE}")
-    print(f"Training Batches: {len(train_x)}")
-
-    # 2. Initialize Model
+    # Model
     if args.model_type == 'algebraic':
-        model = AlgebraicTransformerLM(
-            vocab_size=VOCAB_SIZE, d_model=D_MODEL, n_head=N_HEAD,
-            n_layers=N_LAYERS, d_ffn=D_FFN, block_size=BLOCK_SIZE, dropout=DROPOUT,
-            power=POWER
-        ).to(DEVICE)
-    else:
-        # Initialize NanoGPT via Config
-        # NanoGPT expects Bias=True by default for GPT2 reproduction
-        nanogpt_config = GPTConfig(
-            block_size=BLOCK_SIZE,
-            vocab_size=VOCAB_SIZE,
-            n_layer=N_LAYERS,
-            n_head=N_HEAD,
-            n_embd=D_MODEL,
-            dropout=DROPOUT,
-            bias=True
+        model = FastAlgebraicTransformerLM(
+            vocab_size=VOCAB_SIZE, 
+            d_model=cfg['d_model'], 
+            n_head=cfg['n_head'],
+            n_layers=cfg['n_layers'], 
+            d_ffn=4*cfg['d_model'], 
+            block_size=args.block_size, 
+            dropout=cfg['dropout'],
+            power=2.0, # Initial Power
         )
-        model = GPT(nanogpt_config).to(DEVICE)
+    else:
+        nanogpt_config = GPTConfig(
+            block_size=args.block_size, vocab_size=VOCAB_SIZE, n_layer=cfg['n_layers'],
+            n_head=cfg['n_head'], n_embd=cfg['d_model'], dropout=cfg['dropout'], bias=True
+        )
+        model = GPT(nanogpt_config)
 
-    print(f"Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    model.to(DEVICE)
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    total_steps = len(train_x) * EPOCHS
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=0.1)
+    
+    # Scheduler (Warmup + Cosine Decay)
+    warmup_steps = int(total_steps * 0.10) # 10% LR warmup
+    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
-    warmup_steps = int(0.1 * total_steps)
-    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    scheduler_decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_decay], milestones=[warmup_steps])
+    # Mixed Precision
+    pt_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    ctx = torch.amp.autocast(device_type=DEVICE, dtype=pt_dtype)
+    scaler = torch.amp.GradScaler('cuda', enabled=(pt_dtype == torch.float16))
 
-    if not os.path.exists(LOG_FILE):
-        pd.DataFrame(columns=['step', 'train_loss', 'val_loss', 'val_acc', 'lr']).to_csv(LOG_FILE, index=False)
-
+    # State Tracking
     model.train()
-    step = 0
+    train_loss_accum = 0.0
+    log_step_accum = 0 
+    global_step = 0
+    current_power = 2.0
+    start_time = time.time()
 
-    for epoch in range(EPOCHS):
-        print(f"--- Epoch {epoch+1}/{EPOCHS} ---")
-        progress_bar = tqdm(range(len(train_x)))
+    # --- TRAINING LOOP ---
+    optimizer.zero_grad(set_to_none=True)
+    
+    # Flatten loader for easier step tracking
+    train_iter = iter(train_loader)
+    
+    # Progress bar based on optimization steps (not batches)
+    pbar = tqdm(range(total_steps), desc="Training")
+    
+    for step in pbar:
 
-        for i in progress_bar:
-            xb, yb = train_x[i].to(DEVICE), train_y[i].to(DEVICE)
+        if args.model_type == 'algebraic':
+            progress = step / total_steps
+            current_power = update_model_power(model, progress)
+        # Gradient Accumulation Loop
+        for micro_step in range(cfg['accum_steps']):
+            try:
+                xb, yb = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader) # Restart epoch if needed
+                xb, yb = next(train_iter)
+            
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            
+            with ctx:
+                _, loss = model(xb, yb)
+                # Scale loss for accumulation
+                loss = loss / cfg['accum_steps']
+            
+            train_loss_accum += loss.item()
+            scaler.scale(loss).backward()
 
-            _, loss = model(xb, yb)
+        # Optimizer Step
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        
+        global_step += 1
+        log_step_accum += 1
+        
+        # --- PERIODIC EVALUATION (Every 100 steps) ---
+        if global_step % 100 == 0 or global_step == total_steps:
+            # Calculate metrics - FIX: Average over the steps since last log
+            avg_train_loss = train_loss_accum / log_step_accum
+            train_loss_accum = 0.0 # Reset accumulator
+            log_step_accum = 0     # Reset step count
+            
+            val_loss = evaluate(model, val_loader, DEVICE, ctx)
+            val_ppl = math.exp(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Log to CSV
+            csv_writer.writerow([global_step, 1, avg_train_loss, val_loss, val_ppl, current_power, current_lr])
+            csv_file.flush() # Ensure data is written in case of crash
+            
+            # Update TQDM
+            pbar.set_postfix({
+                'Val Loss': f"{val_loss:.3f}",
+                'PPL': f"{val_ppl:.1f}",
+                'Power': f"{current_power:.1f}" if args.model_type == 'algebraic' else "N/A"
+            })
+            
+            # Save intermediate checkpoint
+            torch.save(model.state_dict(), os.path.join(OUT_DIR, 'latest_ckpt.pt'))
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
-            scheduler.step()
-
-            step += 1
-            progress_bar.set_description(f"Train Loss: {loss.item():.4f}")
-
-            if step % 100 == 0:
-                val_loss, val_acc = evaluate(model, val_data, DEVICE)
-                current_lr = scheduler.get_last_lr()[0]
-                tqdm.write(f"Step {step} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
-
-                log_entry = pd.DataFrame([[step, loss.item(), val_loss, val_acc, current_lr]],
-                                       columns=['step', 'train_loss', 'val_loss', 'val_acc', 'lr'])
-                log_entry.to_csv(LOG_FILE, mode='a', header=False, index=False)
-                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/latest_model.pt")
-
-            if step % 1000 == 0:
-                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/step_{step}.pt")
-
-    print(f"Training Complete. Log saved to {LOG_FILE}")
+    # --- FINISH ---
+    print("\nTraining Complete.")
+    csv_file.close()
+    
+    # Save Final Model
+    torch.save(model.state_dict(), os.path.join(OUT_DIR, 'final_model.pt'))
+    print(f"Saved final model to {os.path.join(OUT_DIR, 'final_model.pt')}")
 
 if __name__ == "__main__":
     main()
