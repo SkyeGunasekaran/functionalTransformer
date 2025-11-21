@@ -1,44 +1,91 @@
+import os
 import torch
-from tqdm import tqdm
-import tiktoken
-from datasets import load_dataset
+import numpy as np
+from datasets import load_dataset 
+import tiktoken 
+from torch.utils.data import Dataset, DataLoader
 
-# ==============================================================================
-# 2. ROBUST DATA LOADER (Wikitext-103 + TikToken)
-# ==============================================================================
-
-class WikitextLoader:
-    def __init__(self, block_size, batch_size):
+class WikitextDataset(Dataset):
+    def __init__(self, data_dir, split, block_size):
         self.block_size = block_size
-        self.batch_size = batch_size
-        self.tokenizer = tiktoken.get_encoding("gpt2") # Standard 50k Vocab
-        print("Loading Wikitext-103 from HuggingFace...")
-        # Using 'wikitext-2-v1' for faster debugging, switch to 'wikitext-103-v1' for full run
-        self.dataset = load_dataset("wikitext", "wikitext-103-v1") 
+        filename = os.path.join(data_dir, f"{split}.bin")
         
-    def prepare_data(self, split):
-        data = self.dataset[split]['text']
-        # Flatten and encode
-        print(f"Tokenizing {split} split...")
-        tokenized = []
-        for text in tqdm(data, desc=f"Encoding {split}"):
-            if len(text) > 0:
-                tokenized.extend(self.tokenizer.encode(text))
-                tokenized.append(self.tokenizer.eot_token) # End of article
+        # 1. Load or Create the binary file (Memory Mapped)
+        if not os.path.exists(filename):
+            self._create_bin_file(filename, split)
         
-        return torch.tensor(tokenized, dtype=torch.long)
+        # Load as a memory map
+        self.data = np.memmap(filename, dtype=np.uint16, mode='r')
+        
+        # CRITICAL FIX 1: Calculate length based on BLOCKS, not tokens
+        # We divide total tokens by block_size to get number of full sequences
+        self.num_samples = (len(self.data) - 1) // self.block_size
+        
+        print(f"Loaded {split} data from {filename}")
+        print(f"Tokens: {len(self.data)/1e6:.2f}M | Sequences: {self.num_samples}")
 
-    def get_loader(self, split):
-        data = self.prepare_data(split)
-        n_batches = len(data) // (self.batch_size * self.block_size)
-        # Trim to fit perfectly
-        data = data[:n_batches * self.batch_size * self.block_size]
-        x = torch.stack([data[i:i+self.block_size] for i in range(0, len(data), self.block_size)])
-        y = torch.stack([data[i+1:i+self.block_size+1] for i in range(0, len(data), self.block_size)])
+    def _create_bin_file(self, filename, split):
+        print(f"--- Pre-processing {split} split (One time only) ---")
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         
-        # Reshape into batches
-        # This simple loader yields pre-batched tensors for speed
-        x = x.view(-1, self.batch_size, self.block_size)
-        y = y.view(-1, self.batch_size, self.block_size)
+        dataset = load_dataset("wikitext", "wikitext-103-v1", split=split)
+        tokenizer = tiktoken.get_encoding("gpt2")
         
-        return x, y, self.tokenizer.n_vocab
+        tokenized = []
+        for item in dataset:
+            if len(item['text']) > 0:
+                tokenized.extend(tokenizer.encode(item['text']))
+                tokenized.append(tokenizer.eot_token)
+        
+        arr = np.array(tokenized, dtype=np.uint16)
+        with open(filename, 'wb') as f:
+            f.write(arr.tobytes())
+        print(f"Saved binary to {filename}")
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # CRITICAL FIX 2: Stride by block_size
+        # Instead of idx, we start at idx * block_size
+        start_idx = idx * self.block_size
+        end_idx = start_idx + self.block_size + 1
+        
+        # Slice
+        chunk = torch.from_numpy((self.data[start_idx : end_idx]).astype(np.int64))
+        
+        x = chunk[:-1]
+        y = chunk[1:]
+        return x, y
+
+def get_dataloaders(batch_size, block_size, num_workers=4):
+    data_dir = "data/wikitext_cache"
+    
+    # Instantiate tokenizer once just to get the real vocab size
+    tokenizer = tiktoken.get_encoding("gpt2")
+    vocab_size = tokenizer.n_vocab
+
+    train_ds = WikitextDataset(data_dir, "train", block_size)
+    val_ds = WikitextDataset(data_dir, "validation", block_size)
+
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        pin_memory=True, 
+        persistent_workers=True,
+        drop_last=True 
+    )
+
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        pin_memory=True, 
+        persistent_workers=True,
+        drop_last=True
+    )
+    
+    return train_loader, val_loader, vocab_size
