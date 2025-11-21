@@ -1,279 +1,213 @@
 import torch
-import os
-import argparse
-import csv
-import time
-import random
+import torch.nn as nn
+import torch.nn.functional as F
 import math
-import numpy as np
-from tqdm import tqdm
-from data.wikitext_loader import get_dataloaders
-from models.fast_algebraic import FastAlgebraicTransformerLM
-from models.nanogpt import GPT, GPTConfig 
 
 # -----------------------------------------------------------------------------
-# 1. Scientific Configuration
+# 1. STRICTLY TYPED JIT KERNELS (The Speedup Sauce)
 # -----------------------------------------------------------------------------
-CONFIGS = {
-    # Target: ~50M Params
-    # Breakdown: 26M (Embeddings) + 25M (Layers) = ~51M Total
-    'small':  {
-        'd_model': 512, 
-        'n_head': 8,  
-        'n_layers': 8,   
-        'batch_size': 8, 
-        'accum_steps': 8, 
-        'lr': 8e-4,      
-        'dropout': 0.1
-    },
 
-    # Target: ~85M Params
-    # Breakdown: 39M (Embeddings) + 42M (Layers) = ~81M Total
-    'medium': {
-        'd_model': 768, 
-        'n_head': 12, 
-        'n_layers': 6,   
-        'batch_size': 8,  
-        'accum_steps': 8, 
-        'lr': 7e-4,    
-        'dropout': 0.1
-    },
+@torch.jit.script
+def fused_algebraic_norm(x: torch.Tensor, gain: torch.Tensor, bias: torch.Tensor, eps: float) -> torch.Tensor:
+    mu = x.mean(dim=-1, keepdim=True)
+    x_centered = x - mu
+    l1_norm = x_centered.abs().mean(dim=-1, keepdim=True)
+    return (gain * (x_centered / (l1_norm + eps))) + bias
 
-    # Target: ~120M Params (Standard GPT-2 Small)
-    # Breakdown: 39M (Embeddings) + 85M (Layers) = ~124M Total
-    'large':  {
-        'd_model': 768, 
-        'n_head': 12, 
-        'n_layers': 12, 
-        'batch_size': 8,  
-        'accum_steps': 8, 
-        'lr': 6e-4,   
-        'dropout': 0.1
-    }
-}
-
-# -----------------------------------------------------------------------------
-# 2. Power Scheduler (Curriculum Learning)
-# -----------------------------------------------------------------------------
-def update_model_power(model, progress, start_power=2.0, max_power=8.0):
-    """
-    Applies the annealing schedule to the Algebraic Attention.
-    Schedule: Linear Ramp (0% -> 60%) -> Constant Max (60% -> 100%)
-    """
-    anneal_cutoff = 0.60 # Anneal over the first 60% of training
+@torch.jit.script
+def fused_rational_softmax(x: torch.Tensor, power: torch.Tensor, eps: float) -> torch.Tensor:
+    # 1. Algebraic Sigmoid
+    # We use sign * x to avoid creating a new abs() tensor if memory is tight, 
+    # but x.abs() is generally optimized enough.
+    s = x / (x.abs() + 1.0)
+    p_base = (s + 1.0) * 0.5 
     
-    if progress < anneal_cutoff:
-        # Linear Ramp: Start -> Target
-        pct = progress / anneal_cutoff
-        new_power = start_power + (max_power - start_power) * pct
-    else:
-        # Constant Max Phase (The "Sharp" Phase)
-        new_power = max_power
-    
-    # In-place update of registered buffers
-    if hasattr(model, 'update_power'):
-        model.update_power(new_power)
-    
-    return new_power
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.manual_seed_all(seed)
-        # For strict scientific reproducibility (might slow down slightly)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-def get_device():
-    if torch.cuda.is_available(): return 'cuda'
-    if torch.backends.mps.is_available(): return 'mps'
-    return 'cpu'
-
-@torch.no_grad()
-def evaluate(model, val_loader, device, ctx):
-    model.eval()
-    total_loss = 0
-    count = 0
-    
-    for xb, yb in val_loader:
-        xb, yb = xb.to(device), yb.to(device)
-        with ctx:
-            _, loss = model(xb, yb)
-        total_loss += loss.item()
-        count += 1
+    # 2. Dynamic Power (Annealing friendly)
+    # Because 'power' is a 0-dim tensor, JIT handles this efficiently without recompiling
+    unnorm_probs = torch.pow(p_base, power)
         
-    avg_loss = total_loss / count if count > 0 else 0
-    model.train()
-    return avg_loss
+    # 3. Normalization
+    sum_probs = unnorm_probs.sum(dim=-1, keepdim=True)
+    return unnorm_probs / (sum_probs + eps)
+
+@torch.jit.script
+def fused_swish(x: torch.Tensor) -> torch.Tensor:
+    return x * (((x / (x.abs() + 1.0)) + 1.0) * 0.5)
+
+@torch.jit.script
+def compute_chunk_scores(Q_chunk: torch.Tensor, K: torch.Tensor, 
+                            alibi_slopes: torch.Tensor, 
+                            k_idx: torch.Tensor, q_idx_start: int,
+                            static_scale: float) -> torch.Tensor:
+    # (B, H, Chunk, T)
+    scores = torch.matmul(Q_chunk, K.transpose(-2, -1))
+    scores = (scores * static_scale) * 16.0
+    
+    # Scalar generation (No tensor overhead)
+    chunk_len = scores.size(-2)
+    q_idx = torch.arange(q_idx_start, q_idx_start + chunk_len, device=scores.device, dtype=torch.float32)
+    
+    # Implicit Distance Matrix
+    # (1, 1, 1, T) - (1, 1, Chunk, 1)
+    distance = k_idx[None, None, None, :] - q_idx[None, None, :, None]
+    
+    # Apply ALiBi In-Place (Saves Memory)
+    scores.addcmul_(alibi_slopes, distance.abs(), value=-1.0)
+    
+    # Masking: Use scalar -10000.0
+    scores = torch.where(distance > 0, -10000.0, scores)
+    return scores
 
 # -----------------------------------------------------------------------------
-# 3. Main Loop
+# 2. OPTIMIZED MODULES
 # -----------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, required=True, choices=['nanogpt', 'algebraic'])
-    parser.add_argument('--size', type=str, default='small', choices=['small', 'medium', 'large'])
-    parser.add_argument('--seed', type=int, default=1337)
-    parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=1) 
-    parser.add_argument('--block_size', type=int, default=1024)
-    args = parser.parse_args()
 
-    set_seed(args.seed)
-    DEVICE = get_device()
-    # High precision for accumulation stability
-    torch.set_float32_matmul_precision('high') 
+class AlgebraicNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.gain = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
     
-    cfg = CONFIGS[args.size]
-    
-    # Run Config
-    RUN_NAME = f"{args.model_type}_{args.size}_s{args.seed}"
-    OUT_DIR = f"results/{RUN_NAME}"
-    os.makedirs(OUT_DIR, exist_ok=True)
-    
-    # CSV Logger Setup
-    csv_path = os.path.join(OUT_DIR, 'metrics.csv')
-    csv_file = open(csv_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    # Header
-    csv_writer.writerow(['step', 'epoch', 'train_loss', 'val_loss', 'val_ppl', 'power', 'lr'])
-    
-    print(f"\n=== STARTING EXPERIMENT: {RUN_NAME} ===")
-    print(f"Config: {cfg}")
-    
-    # Data
-    print("Loading WikiText-103...")
-    train_loader, val_loader, VOCAB_SIZE = get_dataloaders(
-        cfg['batch_size'], args.block_size, num_workers=args.workers
-    )
-    
-    # Calculation of steps
-    steps_per_epoch = len(train_loader) // cfg['accum_steps']
-    total_steps = steps_per_epoch * args.epochs
-    print(f"Vocab: {VOCAB_SIZE} | Total Optimization Steps: {total_steps}")
+    def forward(self, x):
+        return fused_algebraic_norm(x, self.gain, self.bias, self.eps)
 
-    # Model
-    if args.model_type == 'algebraic':
-        model = FastAlgebraicTransformerLM(
-            vocab_size=VOCAB_SIZE, 
-            d_model=cfg['d_model'], 
-            n_head=cfg['n_head'],
-            n_layers=cfg['n_layers'], 
-            d_ffn=4*cfg['d_model'], 
-            block_size=args.block_size, 
-            dropout=cfg['dropout'],
-            power=2.0, # Initial Power
-        )
-    else:
-        nanogpt_config = GPTConfig(
-            block_size=args.block_size, vocab_size=VOCAB_SIZE, n_layer=cfg['n_layers'],
-            n_head=cfg['n_head'], n_embd=cfg['d_model'], dropout=cfg['dropout'], bias=True
-        )
-        model = GPT(nanogpt_config)
+class RationalSoftmax(nn.Module):
+    def __init__(self, power=2.0, eps=1e-6): 
+        super().__init__()
+        # FIX: Register as buffer so it works with the JIT kernel expecting a Tensor
+        self.register_buffer('power_tensor', torch.tensor(float(power)))
+        self.eps = eps
 
-    model.to(DEVICE)
-    print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    def forward(self, x):
+        return fused_rational_softmax(x, self.power_tensor, self.eps)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=0.1)
-    
-    # Scheduler (Warmup + Cosine Decay)
-    warmup_steps = int(total_steps * 0.10) # 10% LR warmup
-    scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps))
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
+class AlgebraicSwish(nn.Module):
+    def forward(self, x):
+        return fused_swish(x)
 
-    # Mixed Precision
-    pt_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    ctx = torch.amp.autocast(device_type=DEVICE, dtype=pt_dtype)
-    scaler = torch.amp.GradScaler('cuda', enabled=(pt_dtype == torch.float16))
-
-    # State Tracking
-    model.train()
-    train_loss_accum = 0.0
-    log_step_accum = 0 
-    global_step = 0
-    current_power = 2.0
-    start_time = time.time()
-
-    # --- TRAINING LOOP ---
-    optimizer.zero_grad(set_to_none=True)
-    
-    # Flatten loader for easier step tracking
-    train_iter = iter(train_loader)
-    
-    # Progress bar based on optimization steps (not batches)
-    pbar = tqdm(range(total_steps), desc="Training")
-    
-    for step in pbar:
-
-        if args.model_type == 'algebraic':
-            progress = step / total_steps
-            current_power = update_model_power(model, progress)
-        # Gradient Accumulation Loop
-        for micro_step in range(cfg['accum_steps']):
-            try:
-                xb, yb = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader) # Restart epoch if needed
-                xb, yb = next(train_iter)
-            
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            
-            with ctx:
-                _, loss = model(xb, yb)
-                # Scale loss for accumulation
-                loss = loss / cfg['accum_steps']
-            
-            train_loss_accum += loss.item()
-            scaler.scale(loss).backward()
-
-        # Optimizer Step
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+class AlgebraicAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout=0.1, power=2.0, query_chunk_size=512):
+        super().__init__()
+        self.n_head = n_head
+        self.d_head = d_model // n_head
+        self.query_chunk_size = query_chunk_size
         
-        global_step += 1
-        log_step_accum += 1
+        # Annealing Buffer
+        self.register_buffer('power_tensor', torch.tensor(float(power)))
         
-        # --- PERIODIC EVALUATION (Every 100 steps) ---
-        if global_step % 100 == 0 or global_step == total_steps:
-            # Calculate metrics - FIX: Average over the steps since last log
-            avg_train_loss = train_loss_accum / log_step_accum
-            train_loss_accum = 0.0 # Reset accumulator
-            log_step_accum = 0     # Reset step count
-            
-            val_loss = evaluate(model, val_loader, DEVICE, ctx)
-            val_ppl = math.exp(val_loss)
-            current_lr = optimizer.param_groups[0]['lr']
-            
-            # Log to CSV
-            csv_writer.writerow([global_step, 1, avg_train_loss, val_loss, val_ppl, current_power, current_lr])
-            csv_file.flush() # Ensure data is written in case of crash
-            
-            # Update TQDM
-            pbar.set_postfix({
-                'Val Loss': f"{val_loss:.3f}",
-                'PPL': f"{val_ppl:.1f}",
-                'Power': f"{current_power:.1f}" if args.model_type == 'algebraic' else "N/A"
-            })
-            
-            # Save intermediate checkpoint
-            torch.save(model.state_dict(), os.path.join(OUT_DIR, 'latest_ckpt.pt'))
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.static_scale = 1.0 / (self.d_head ** 0.5)
+        self.dropout = nn.Dropout(dropout)
+        self.softmax_eps = 1e-6
 
-    # --- FINISH ---
-    print("\nTraining Complete.")
-    csv_file.close()
-    
-    # Save Final Model
-    torch.save(model.state_dict(), os.path.join(OUT_DIR, 'final_model.pt'))
-    print(f"Saved final model to {os.path.join(OUT_DIR, 'final_model.pt')}")
+        # ALiBi Setup
+        closest_power_of_2 = 2 ** math.floor(math.log2(n_head))
+        base = 2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3)))
+        powers = torch.arange(1, 1 + closest_power_of_2)
+        slopes = torch.pow(base, powers)
+        if closest_power_of_2 != n_head:
+            extra_base = 2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3)))
+            num_rem = min(closest_power_of_2, n_head - closest_power_of_2)
+            slopes = torch.cat([slopes, torch.pow(extra_base, torch.arange(1, 1 + 2 * num_rem, 2))])
+        self.register_buffer("alibi_slopes", (slopes * 4.0).view(1, n_head, 1, 1))
 
-if __name__ == "__main__":
-    main()
+    def forward(self, x):
+        B, T, C = x.shape
+        # Pre-allocate K index to avoid recreation in loop
+        k_idx = torch.arange(T, device=x.device, dtype=torch.float32)
+
+        Q = self.q_proj(x).reshape(B, T, self.n_head, self.d_head).transpose(1, 2)
+        K = self.k_proj(x).reshape(B, T, self.n_head, self.d_head).transpose(1, 2)
+        V = self.v_proj(x).reshape(B, T, self.n_head, self.d_head).transpose(1, 2)
+
+        output_chunks = []
+        current_power = self.power_tensor # Local reference
+
+        for i in range(0, T, self.query_chunk_size):
+            end = min(i + self.query_chunk_size, T)
+            Q_chunk = Q[:, :, i:end, :]
+            
+            # JIT Kernel 1: Scores & Masking
+            scores = compute_chunk_scores(Q_chunk, K, self.alibi_slopes, k_idx, i, self.static_scale)
+            
+            # JIT Kernel 2: Softmax (Dynamic Power)
+            probs = fused_rational_softmax(scores, current_power, self.softmax_eps)
+            
+            attn_weights = self.dropout(probs)
+            output_chunks.append(torch.matmul(attn_weights, V))
+            
+        out = torch.cat(output_chunks, dim=2)
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.out_proj(out)
+
+class FastAlgebraicTransformerLM(nn.Module):
+    def __init__(self, vocab_size, d_model, n_head, n_layers, d_ffn, block_size, dropout=0.1, power=2.0):
+        super().__init__()
+        self.block_size = block_size
+        self.token_embedding_table = nn.Embedding(vocab_size, d_model)
+        
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'attn': AlgebraicAttention(d_model, n_head, dropout, power, query_chunk_size=128),
+                'ffn': nn.Sequential(
+                    nn.Linear(d_model, d_ffn),
+                    AlgebraicSwish(),
+                    nn.Linear(d_ffn, d_model),
+                    nn.Dropout(dropout)
+                ),
+                'norm1': AlgebraicNorm(d_model), 'norm2': AlgebraicNorm(d_model)
+            }) for _ in range(n_layers)
+        ])
+        
+        self.final_norm = AlgebraicNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+        # FIX: Use the class that now correctly has a power buffer
+        self.final_softmax = RationalSoftmax(power=power)
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None: torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def update_power(self, new_power):
+        """
+        Updates the power parameter for all attention heads and the final softmax.
+        Call this in your training loop.
+        """
+        # Update Attention blocks
+        for block in self.blocks:
+            block['attn'].power_tensor.fill_(new_power)
+        # Update Final Softmax
+        self.final_softmax.power_tensor.fill_(new_power)
+
+    def forward(self, idx, targets=None):
+        x = self.token_embedding_table(idx)
+        for block in self.blocks:
+            x = x + block['attn'](block['norm1'](x))
+            x = x + block['ffn'](block['norm2'](x))
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        
+        loss = None
+        if targets is not None:
+            # Optim: View logits directly
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            
+            # Use the Final Softmax (which is now annealed!)
+            probs = self.final_softmax(logits_flat)
+            
+            # Gather optimized
+            p_target = probs.gather(dim=-1, index=targets_flat.unsqueeze(-1)).squeeze(-1)
+            p_target = torch.clamp(p_target, min=1e-9, max=1.0)
+            loss = -torch.log(p_target).mean()
+            
+        return logits, loss
